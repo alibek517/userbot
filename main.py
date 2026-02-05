@@ -525,7 +525,7 @@ def create_message_handler(phone: str):
 
         forward_text = (
             f"🔔 <b>Yangi buyurtma</b>\n"
-            f"📍 Guruh1: <b>{html.escape(group_name)}</b>\n"
+            f"📍 Guruh12: <b>{html.escape(group_name)}</b>\n"
             f"👤 Kimdan: {client_html}\n\n"
             f"{safe_text}\n\n"
             f"🔗 {message_link}"
