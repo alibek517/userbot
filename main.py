@@ -45,11 +45,15 @@ running_clients = {}        # phone -> asyncio.Task
 ALL_PHONES = []             # full phones list for statistics
 
 # ===== DEDUPE (MUHIM!) =====
-# Bir xil guruhda 2-3 akkaunt turganda bitta xabar 2-3 marta yuborilib Bot API 429 bo'lib qoladi.
-# Shuni oldini olish uchun: (chat_id, msg_id) bo'yicha 1 marta forward qilamiz.
-forwarded_cache: Dict[Tuple[int, int], float] = {}
-FORWARD_TTL = 120  # 2 minut
+# status: "queued" yoki "sent"
+forwarded_cache: Dict[Tuple[int, int], Dict[str, float]] = {}
+FORWARD_TTL = 300  # 5 minut
 forward_lock = asyncio.Lock()
+
+# ===== OUTBOUND QUEUE (MUHIM!) =====
+send_queue: asyncio.Queue = asyncio.Queue(maxsize=5000)
+SEND_WORKERS = int(os.getenv("SEND_WORKERS", "6") or "6")  # katta guruhlar uchun 4-8 yaxshi
+aiohttp_session: aiohttp.ClientSession = None
 
 
 # ===================== HELPERS =====================
@@ -141,18 +145,43 @@ def get_message_link(message: Message) -> str:
 
 
 def get_chat_link(message: Message) -> str:
-    """
-    Guruhni ochib beradigan link.
-    Agar public username bo'lsa: https://t.me/username
-    Aks holda private supergroup: https://t.me/c/<id> (message bo'lmasdan ochilmaydi)
-    Shuning uchun private holatda message linkdan "chat"ni ochish ham shu link bo'ladi.
-    """
     chat = message.chat
     if chat.username:
         return f"https://t.me/{chat.username}"
-    # private supergroup/channel uchun "c/<id>" faqat message bilan ishlaydi,
-    # shuning uchun fallback message linkdan foydalanamiz
     return get_message_link(message)
+
+
+def build_sender_anchor(message: Message) -> str:
+    """
+    Kimdan kelganini bosiladigan link qilib qaytaradi.
+    - User bo'lsa: username bo'lsa t.me/username, bo'lmasa tg://user?id=
+    - sender_chat bo'lsa (kanal/anonymous admin): username bo'lsa t.me/username, bo'lmasa message link
+    """
+    if message.from_user:
+        u = message.from_user
+        name = f"@{u.username}" if u.username else "Клент личкаси"
+        safe_name = html.escape(name)
+
+        if u.username:
+            link = f"https://t.me/{u.username}"
+        else:
+            link = f"tg://user?id={u.id}"
+
+        return f'<a href="{html.escape(link)}">{safe_name}</a>'
+
+    if getattr(message, "sender_chat", None):
+        sc = message.sender_chat
+        title = sc.title or "Sender"
+        safe_title = html.escape(title)
+
+        if sc.username:
+            link = f"https://t.me/{sc.username}"
+            return f'<a href="{html.escape(link)}">{safe_title}</a>'
+
+        ml = get_message_link(message)
+        return f'<a href="{html.escape(ml)}">{html.escape(title)}</a>'
+
+    return "Noma'lum"
 
 
 # ===================== SEND TO DRIVERS GROUP =====================
@@ -160,16 +189,9 @@ async def send_to_drivers_group(
     text: str,
     group_link: str,
     message_link: str,
-    extra_urls: Optional[List[str]] = None
+    extra_urls: Optional[List[str]] = None,
+    session: Optional[aiohttp.ClientSession] = None
 ):
-    """
-    Tugmalar:
-      - Guruhga o'tish
-      - Xabarga o'tish
-      - (bo'lsa) Link 1..3
-
-    Bot API 429 (Too Many Requests) bo'lsa retry qiladi.
-    """
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
     keyboard = [[
@@ -189,31 +211,87 @@ async def send_to_drivers_group(
         "reply_markup": {"inline_keyboard": keyboard},
     }
 
+    own_session = False
+    if session is None:
+        session = aiohttp.ClientSession()
+        own_session = True
+
     try:
-        async with aiohttp.ClientSession() as session:
-            for attempt in range(4):  # 0..3
-                async with session.post(url, json=payload, timeout=30) as resp:
-                    if resp.status == 200:
-                        print(f"✅ Xabar yuborildi: {message_link}")
-                        return
+        for attempt in range(8):  # ko'proq retry
+            async with session.post(url, json=payload, timeout=30) as resp:
+                if resp.status == 200:
+                    # muvaffaqiyat
+                    return True
 
-                    # 429 -> retry_after kutish
-                    if resp.status == 429:
-                        retry_after = 3
-                        try:
-                            j = await resp.json()
-                            retry_after = int(j.get("parameters", {}).get("retry_after", retry_after))
-                        except Exception:
-                            pass
-                        print(f"⏳ Bot API Flood (429). {retry_after}s kutyapman... attempt={attempt + 1}")
-                        await asyncio.sleep(retry_after + 1)
-                        continue
+                if resp.status == 429:
+                    retry_after = 3
+                    try:
+                        j = await resp.json()
+                        retry_after = int(j.get("parameters", {}).get("retry_after", retry_after))
+                    except Exception:
+                        pass
+                    print(f"⏳ Bot API Flood (429). {retry_after}s kutyapman... attempt={attempt + 1}")
+                    await asyncio.sleep(retry_after + 1)
+                    continue
 
-                    body = await resp.text()
-                    print(f"❌ Xabar yuborishda xato ({resp.status}): {body}")
-                    return
+                body = await resp.text()
+                print(f"❌ Xabar yuborishda xato ({resp.status}): {body}")
+                return False
     except Exception as e:
         print(f"❌ Xabar yuborishda xato: {e}")
+        return False
+    finally:
+        if own_session:
+            await session.close()
+
+
+async def send_worker(worker_id: int):
+    """
+    Queue'dan olib yuboradi.
+    Muhim: muvaffaqiyatli yuborilgandan keyin dedupe status="sent" qiladi.
+    Xato bo'lsa cache_key ni o'chiradi (boshqa akkaunt qayta urinishi uchun).
+    """
+    global aiohttp_session, forwarded_cache
+
+    while True:
+        item = await send_queue.get()
+        try:
+            cache_key, forward_text, group_link, message_link, urls = item
+
+            ok = await send_to_drivers_group(
+                forward_text,
+                group_link=group_link,
+                message_link=message_link,
+                extra_urls=urls,
+                session=aiohttp_session
+            )
+
+            if ok:
+                print(f"✅ Yuborildi: {message_link}")
+                async with forward_lock:
+                    forwarded_cache[cache_key] = {"ts": time.time(), "status": "sent"}
+            else:
+                # yuborilmadi -> boshqa akkaunt urinishi uchun cache dan olib tashlaymiz
+                async with forward_lock:
+                    forwarded_cache.pop(cache_key, None)
+
+            # TTL tozalash
+            async with forward_lock:
+                now_ts = time.time()
+                for k, st in list(forwarded_cache.items()):
+                    if now_ts - float(st.get("ts", 0)) > FORWARD_TTL:
+                        forwarded_cache.pop(k, None)
+
+        except Exception as e:
+            try:
+                cache_key = item[0]
+                async with forward_lock:
+                    forwarded_cache.pop(cache_key, None)
+            except Exception:
+                pass
+            print(f"⚠️ send_worker[{worker_id}] xato: {e}")
+        finally:
+            send_queue.task_done()
 
 
 # ===================== STATISTICS =====================
@@ -466,12 +544,8 @@ def create_message_handler(phone: str):
         chat_id = message.chat.id
         group_name = getattr(message.chat, "title", None) or f"Chat {chat_id}"
 
-        # loop oldini olish
+        # loop oldini olish: faqat DRIVERS guruhdan qaytmasin
         if normalize_chat_id(chat_id) == normalize_chat_id(DRIVERS_GROUP_ID):
-            return
-        if getattr(message, "outgoing", False):
-            return
-        if message.from_user and getattr(message.from_user, "is_bot", False):
             return
 
         # keywords refresh
@@ -485,6 +559,8 @@ def create_message_handler(phone: str):
             return
 
         lower_text = cleaned_text.lower()
+
+        # keyword
         matched_keyword = None
         for kw in keywords_cache:
             if kw and kw in lower_text:
@@ -493,29 +569,16 @@ def create_message_handler(phone: str):
         if not matched_keyword:
             return
 
-        # ===== DEDUPE: bitta xabarni faqat 1 marta forward qilish =====
         cache_key = (normalize_chat_id(chat_id), int(message.id))
-        now_ts = time.time()
 
+        # agar allaqachon queued/sent bo'lsa skip
         async with forward_lock:
-            # eski yozuvlarni tozalash
-            for k, ts in list(forwarded_cache.items()):
-                if now_ts - ts > FORWARD_TTL:
-                    forwarded_cache.pop(k, None)
-
-            if cache_key in forwarded_cache:
-                # boshqa akkaunt allaqachon forward qilgan
+            st = forwarded_cache.get(cache_key)
+            if st and st.get("status") in ("queued", "sent"):
                 return
 
-            forwarded_cache[cache_key] = now_ts
-
-        # save hit
-        await save_keyword_hit(matched_keyword, chat_id, group_name, phone, cleaned_text)
-
-        # who (matn ichida ko'rsatish uchun)
-        username = getattr(message.from_user, "username", None) if message.from_user else None
-        label = f"@{username}" if username else "Клент личкаси"
-        client_html = html.escape(label)
+        # sender (bosiladigan link)
+        client_html = build_sender_anchor(message)
 
         # source link
         message_link = get_message_link(message)
@@ -525,18 +588,24 @@ def create_message_handler(phone: str):
 
         forward_text = (
             f"🔔 <b>Yangi buyurtma</b>\n"
-            f"📍 Guruh12: <b>{html.escape(group_name)}</b>\n"
+            f"📍 Guruh: <b>{html.escape(group_name)}</b>\n"
             f"👤 Kimdan: {client_html}\n\n"
             f"{safe_text}\n\n"
             f"🔗 {message_link}"
         )
 
-        await send_to_drivers_group(
-            forward_text,
-            group_link=group_link,
-            message_link=message_link,
-            extra_urls=urls
-        )
+        # hit log (bloklamasin)
+        asyncio.create_task(save_keyword_hit(matched_keyword, chat_id, group_name, phone, cleaned_text))
+
+        # queue ga tashlaymiz
+        try:
+            send_queue.put_nowait((cache_key, forward_text, group_link, message_link, urls))
+        except asyncio.QueueFull:
+            await send_queue.put((cache_key, forward_text, group_link, message_link, urls))
+
+        # ENDI status "queued" qo'yamiz (xabar aniq queuega tushdi)
+        async with forward_lock:
+            forwarded_cache[cache_key] = {"ts": time.time(), "status": "queued"}
 
         print(f"📨 [{phone}] Topildi: '{matched_keyword}' - {group_name}")
 
@@ -555,7 +624,16 @@ async def run_client(phone: str, retry_count: int = 0):
     update_account_status(phone, "connecting")
 
     session_name = f"userbot_session_{phone.replace('+', '').replace(' ', '')}"
-    client = Client(session_name, api_id=API_ID, api_hash=API_HASH, phone_number=phone)
+
+    # Katta guruhlar uchun workers ko'paytirdik
+    client = Client(
+        session_name,
+        api_id=API_ID,
+        api_hash=API_HASH,
+        phone_number=phone,
+        workers=16,
+        sleep_threshold=30
+    )
 
     client.on_message(filters.group | filters.channel)(create_message_handler(phone))
 
@@ -605,13 +683,19 @@ async def run_client(phone: str, retry_count: int = 0):
 
 # ===================== MAIN =====================
 async def main():
-    global ALL_PHONES
+    global ALL_PHONES, aiohttp_session
 
     print("🚀 UserBot Multi-Account ishga tushmoqda...")
 
     if not init_supabase():
         print("❌ Supabase'ga ulanib bo'lmadi. Chiqish...")
         sys.exit(1)
+
+    # AIOHTTP session + workerlar (BIR MARTA)
+    aiohttp_session = aiohttp.ClientSession()
+    for i in range(max(1, SEND_WORKERS)):
+        asyncio.create_task(send_worker(i + 1))
+    print(f"📤 Yuborish workerlari: {max(1, SEND_WORKERS)} ta")
 
     await load_groups_cache()
     await ensure_accounts_seeded_from_env()
@@ -659,7 +743,25 @@ if __name__ == "__main__":
         print("\n👋 UserBot to'xtatildi")
         for phone in list(running_clients.keys()) or PHONE_NUMBERS_ENV_FALLBACK:
             update_account_status(phone, "stopped")
+        # Session yopish (best effort)
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            if aiohttp_session and not aiohttp_session.closed:
+                loop.run_until_complete(aiohttp_session.close())
+            loop.close()
+        except Exception:
+            pass
     except Exception as e:
         print(f"❌ Kritik xato: {e}")
         for phone in list(running_clients.keys()):
             update_account_status(phone, "error")
+        # Session yopish (best effort)
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            if aiohttp_session and not aiohttp_session.closed:
+                loop.run_until_complete(aiohttp_session.close())
+            loop.close()
+        except Exception:
+            pass
