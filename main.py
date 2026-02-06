@@ -127,10 +127,8 @@ def session_base_for_phone(phone: str) -> str:
     return os.path.join(SESS_DIR, f"userbot_{clean}")
 
 
+# NOTE: endi session delete funksiya qoldi, lekin AUTH_KEY_DUPLICATED holatda ishlatmaymiz.
 async def safe_delete_session_files(session_base: str, tries: int = 8) -> bool:
-    """
-    Windows'da file lock bo'lsa ham bir necha marta urinib o'chiradi.
-    """
     paths = [f"{session_base}.session", f"{session_base}.session-journal"]
     ok_any = False
 
@@ -406,7 +404,7 @@ def fetch_phone_numbers_from_db() -> list:
             if not phone:
                 continue
 
-            # faqat ishlatiladiganlar (disabled bo'lsa RUN qilmaydi)
+            # faqat ishlatiladiganlar
             if status in ["pending", "active", "connecting"]:
                 phones.append(phone)
 
@@ -584,12 +582,12 @@ async def save_keyword_hit(keyword: str, group_id: int, group_name: str, phone: 
 async def admin_command_poller():
     """
     Admin DM komandalar:
-      /add +998901234567
-      /del +998901234567     -> DB + session delete
-      /disable +998...       -> DB status=disabled
-      /enable +998...        -> DB status=pending
+      /add +998...
+      /del +998...      -> DB + session delete (ixtiyoriy)
+      /disable +998...
+      /enable +998...
       /list
-      /where                -> CWD / sessions papka
+      /where
     """
     global aiohttp_session, supabase
     if not BOT_TOKEN or not ADMIN_ID:
@@ -684,13 +682,14 @@ async def admin_command_poller():
                     continue
 
                 phone = _normalize_phone(parts[1])
+
                 # DB delete
                 try:
                     supabase.table("userbot_accounts").delete().eq("phone_number", phone).execute()
                 except Exception:
                     pass
 
-                # Session delete
+                # Session delete (ixtiyoriy)
                 sess_base = session_base_for_phone(phone)
                 deleted = await safe_delete_session_files(sess_base, tries=10)
 
@@ -785,7 +784,7 @@ async def run_client(phone: str):
     session_base = session_base_for_phone(phone)
 
     client = Client(
-        session_base,  # <-- MUHIM: full path
+        session_base,
         api_id=API_ID,
         api_hash=API_HASH,
         phone_number=phone,
@@ -820,25 +819,25 @@ async def run_client(phone: str):
         msg = str(e)
         print(f"❌ [{phone}] Xato: {msg}")
 
-        # Avval clientni to'xtatib file lock bo'shashsin
         try:
             await client.stop()
         except Exception:
             pass
 
+        # ===== MUHIM: AUTH_KEY_DUPLICATED bo'lsa SESSION O'CHIRILMAYDI =====
         if "AUTH_KEY_DUPLICATED" in msg:
-            deleted = await safe_delete_session_files(session_base, tries=12)
-            update_account_status(phone, "relogin_required")
-
+            update_account_status(phone, "duplicated_running_elsewhere")
             await notify_admin_once(
                 f"dup_{phone}",
                 "⚠️ AUTH_KEY_DUPLICATED\n"
                 f"📱 Raqam: {phone}\n"
-                f"🧹 Session delete: {'✅' if deleted else '❌ (Win lock, task managerda python yopib qayta)'}\n"
-                "🔁 Qayta login kerak (bitta joyda ishlating)."
+                "✅ Session o'chirilmadi (kod yubormasin uchun).\n"
+                "📌 Bu raqam boshqa joyda ishlayapti. O‘sha joyni STOP qiling.\n"
+                "🔁 Keyin qayta ishga tushiring."
             )
             return
 
+        # AUTH_KEY_UNREGISTERED bo'lsa relogin kerak, sessionni o'chirish mumkin
         if "AUTH_KEY_UNREGISTERED" in msg:
             deleted = await safe_delete_session_files(session_base, tries=12)
             update_account_status(phone, "relogin_required")
