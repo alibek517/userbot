@@ -6,6 +6,7 @@ import time
 import html
 import re
 from typing import Optional, List, Tuple, Dict
+
 from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -22,11 +23,17 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 DRIVERS_GROUP_ID = int(os.getenv("DRIVERS_GROUP_ID", "-1003784903860"))
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "7748145808") or "7748145808")
 
 PHONE_NUMBERS_RAW = os.getenv("PHONE_NUMBER", "")
 PHONE_NUMBERS_ENV_FALLBACK = [
     p.strip().strip('"').strip("'") for p in PHONE_NUMBERS_RAW.split(",") if p.strip()
 ]
+
+# ===================== SESSION DIR (MUHIM) =====================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SESS_DIR = os.path.join(BASE_DIR, "sessions")
+os.makedirs(SESS_DIR, exist_ok=True)
 
 # ===================== GLOBALS =====================
 supabase: SupabaseClient = None
@@ -45,15 +52,18 @@ running_clients = {}        # phone -> asyncio.Task
 ALL_PHONES = []             # full phones list for statistics
 
 # ===== DEDUPE (MUHIM!) =====
-# status: "queued" yoki "sent"
 forwarded_cache: Dict[Tuple[int, int], Dict[str, float]] = {}
-FORWARD_TTL = 300  # 5 minut
+FORWARD_TTL = 300
 forward_lock = asyncio.Lock()
 
-# ===== OUTBOUND QUEUE (MUHIM!) =====
+# ===== OUTBOUND QUEUE =====
 send_queue: asyncio.Queue = asyncio.Queue(maxsize=5000)
-SEND_WORKERS = int(os.getenv("SEND_WORKERS", "6") or "6")  # katta guruhlar uchun 4-8 yaxshi
+SEND_WORKERS = int(os.getenv("SEND_WORKERS", "6") or "6")
 aiohttp_session: aiohttp.ClientSession = None
+
+# ===== ADMIN NOTIFY DEDUPE =====
+_admin_last_notify: Dict[str, float] = {}
+ADMIN_NOTIFY_TTL = 120  # 2 min
 
 
 # ===================== HELPERS =====================
@@ -90,6 +100,56 @@ def init_supabase() -> bool:
     except Exception as e:
         print(f"❌ Supabase ulanishda xato: {e}")
         return False
+
+
+async def notify_admin_once(key: str, text: str):
+    global aiohttp_session, _admin_last_notify
+    if not BOT_TOKEN or not ADMIN_ID or not aiohttp_session:
+        return
+
+    now = time.time()
+    last = _admin_last_notify.get(key, 0)
+    if now - last < ADMIN_NOTIFY_TTL:
+        return
+    _admin_last_notify[key] = now
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": ADMIN_ID, "text": text}
+    try:
+        async with aiohttp_session.post(url, json=payload, timeout=20) as resp:
+            await resp.text()
+    except Exception:
+        pass
+
+
+def session_base_for_phone(phone: str) -> str:
+    clean = phone.replace("+", "").replace(" ", "")
+    return os.path.join(SESS_DIR, f"userbot_{clean}")
+
+
+async def safe_delete_session_files(session_base: str, tries: int = 8) -> bool:
+    """
+    Windows'da file lock bo'lsa ham bir necha marta urinib o'chiradi.
+    """
+    paths = [f"{session_base}.session", f"{session_base}.session-journal"]
+    ok_any = False
+
+    for _ in range(tries):
+        all_done = True
+        for p in paths:
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                    ok_any = True
+                except PermissionError:
+                    all_done = False
+                except OSError:
+                    all_done = False
+        if all_done:
+            return ok_any
+        await asyncio.sleep(0.6)
+
+    return ok_any
 
 
 # ===================== LINK / TEXT CLEAN =====================
@@ -134,7 +194,7 @@ def extract_text_and_urls(message: Message):
     return cleaned, urls
 
 
-# ===================== TELEGRAM MESSAGE/GROUP LINK =====================
+# ===================== TELEGRAM LINKS =====================
 def get_message_link(message: Message) -> str:
     chat = message.chat
     msg_id = message.id
@@ -152,11 +212,6 @@ def get_chat_link(message: Message) -> str:
 
 
 def build_sender_anchor(message: Message) -> str:
-    """
-    Kimdan kelganini bosiladigan link qilib qaytaradi.
-    - User bo'lsa: username bo'lsa t.me/username, bo'lmasa tg://user?id=
-    - sender_chat bo'lsa (kanal/anonymous admin): username bo'lsa t.me/username, bo'lmasa message link
-    """
     if message.from_user:
         u = message.from_user
         name = f"@{u.username}" if u.username else "Клент личкаси"
@@ -179,7 +234,7 @@ def build_sender_anchor(message: Message) -> str:
             return f'<a href="{html.escape(link)}">{safe_title}</a>'
 
         ml = get_message_link(message)
-        return f'<a href="{html.escape(ml)}">{html.escape(title)}</a>'
+        return f'<a href="{html.escape(ml)}">{safe_title}</a>'
 
     return "Noma'lum"
 
@@ -191,7 +246,7 @@ async def send_to_drivers_group(
     message_link: str,
     extra_urls: Optional[List[str]] = None,
     session: Optional[aiohttp.ClientSession] = None
-):
+) -> bool:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
     keyboard = [[
@@ -217,10 +272,9 @@ async def send_to_drivers_group(
         own_session = True
 
     try:
-        for attempt in range(8):  # ko'proq retry
+        for attempt in range(8):
             async with session.post(url, json=payload, timeout=30) as resp:
                 if resp.status == 200:
-                    # muvaffaqiyat
                     return True
 
                 if resp.status == 429:
@@ -230,7 +284,6 @@ async def send_to_drivers_group(
                         retry_after = int(j.get("parameters", {}).get("retry_after", retry_after))
                     except Exception:
                         pass
-                    print(f"⏳ Bot API Flood (429). {retry_after}s kutyapman... attempt={attempt + 1}")
                     await asyncio.sleep(retry_after + 1)
                     continue
 
@@ -246,13 +299,7 @@ async def send_to_drivers_group(
 
 
 async def send_worker(worker_id: int):
-    """
-    Queue'dan olib yuboradi.
-    Muhim: muvaffaqiyatli yuborilgandan keyin dedupe status="sent" qiladi.
-    Xato bo'lsa cache_key ni o'chiradi (boshqa akkaunt qayta urinishi uchun).
-    """
     global aiohttp_session, forwarded_cache
-
     while True:
         item = await send_queue.get()
         try:
@@ -266,17 +313,12 @@ async def send_worker(worker_id: int):
                 session=aiohttp_session
             )
 
-            if ok:
-                print(f"✅ Yuborildi: {message_link}")
-                async with forward_lock:
+            async with forward_lock:
+                if ok:
                     forwarded_cache[cache_key] = {"ts": time.time(), "status": "sent"}
-            else:
-                # yuborilmadi -> boshqa akkaunt urinishi uchun cache dan olib tashlaymiz
-                async with forward_lock:
+                else:
                     forwarded_cache.pop(cache_key, None)
 
-            # TTL tozalash
-            async with forward_lock:
                 now_ts = time.time()
                 for k, st in list(forwarded_cache.items()):
                     if now_ts - float(st.get("ts", 0)) > FORWARD_TTL:
@@ -363,8 +405,11 @@ def fetch_phone_numbers_from_db() -> list:
             phone = _normalize_phone(row.get("phone_number"))
             if not phone:
                 continue
-            if status in ["pending", "active", "error", "connecting"]:
+
+            # faqat ishlatiladiganlar (disabled bo'lsa RUN qilmaydi)
+            if status in ["pending", "active", "connecting"]:
                 phones.append(phone)
+
         return uniq_keep_order(phones)
     except Exception as e:
         print(f"⚠️ Bazadan raqamlarni olishda xato: {e}")
@@ -458,7 +503,6 @@ async def sync_all_groups(client: Client, phone: str) -> list:
                     })
         except FloodWait as fw:
             wait_s = int(getattr(fw, "value", 0) or 0)
-            print(f'[{phone}] Waiting for {wait_s} seconds before continuing (FloodWait GetDialogs)')
             await asyncio.sleep(wait_s + 1)
             async for dialog in client.get_dialogs():
                 chat = dialog.chat
@@ -532,8 +576,142 @@ async def save_keyword_hit(keyword: str, group_id: int, group_name: str, phone: 
             "phone_number": phone,
             "message_preview": preview,
         }).execute()
-    except Exception as e:
-        print(f"⚠️ Statistika saqlashda xato: {e}")
+    except Exception:
+        pass
+
+
+# ===================== ADMIN COMMAND POLLER =====================
+async def admin_command_poller():
+    """
+    Admin DM komandalar:
+      /add +998901234567
+      /del +998901234567     -> DB + session delete
+      /disable +998...       -> DB status=disabled
+      /enable +998...        -> DB status=pending
+      /list
+      /where                -> CWD / sessions papka
+    """
+    global aiohttp_session, supabase
+    if not BOT_TOKEN or not ADMIN_ID:
+        return
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+    offset = 0
+
+    while True:
+        try:
+            params = {"timeout": 50, "offset": offset}
+            async with aiohttp_session.get(url, params=params, timeout=60) as resp:
+                data = await resp.json()
+        except Exception:
+            await asyncio.sleep(2)
+            continue
+
+        for upd in data.get("result", []) or []:
+            offset = max(offset, upd.get("update_id", 0) + 1)
+
+            msg = upd.get("message") or upd.get("edited_message")
+            if not msg:
+                continue
+
+            from_id = (msg.get("from") or {}).get("id")
+            if from_id != ADMIN_ID:
+                continue
+
+            text = (msg.get("text") or "").strip()
+            if not text:
+                continue
+
+            if text.startswith("/where"):
+                await notify_admin_once(
+                    "where",
+                    f"📁 BASE_DIR: {BASE_DIR}\n📁 SESS_DIR: {SESS_DIR}\n📁 CWD: {os.getcwd()}"
+                )
+                continue
+
+            if text.startswith("/add"):
+                parts = text.split()
+                if len(parts) < 2:
+                    await notify_admin_once("usage_add", "❗️Usage: /add +998901234567")
+                    continue
+
+                phone = _normalize_phone(parts[1])
+                if not phone.startswith("+"):
+                    await notify_admin_once("bad_phone", "❗️Raqam + bilan boshlansin: +998...")
+                    continue
+
+                try:
+                    supabase.table("userbot_accounts").upsert({
+                        "phone_number": phone,
+                        "status": "pending",
+                        "two_fa_required": False,
+                    }).execute()
+                    await notify_admin_once(f"add_{phone}", f"✅ Qo'shildi: {phone} (pending)")
+                except Exception as e:
+                    await notify_admin_once(f"add_err_{phone}", f"❌ Qo'shishda xato: {phone}\n{e}")
+                continue
+
+            if text.startswith("/disable"):
+                parts = text.split()
+                if len(parts) < 2:
+                    await notify_admin_once("usage_disable", "❗️Usage: /disable +998...")
+                    continue
+                phone = _normalize_phone(parts[1])
+                try:
+                    supabase.table("userbot_accounts").update({"status": "disabled"}).eq("phone_number", phone).execute()
+                    await notify_admin_once(f"dis_{phone}", f"⛔️ Disabled: {phone}")
+                except Exception as e:
+                    await notify_admin_once(f"dis_err_{phone}", f"❌ Disable xato: {phone}\n{e}")
+                continue
+
+            if text.startswith("/enable"):
+                parts = text.split()
+                if len(parts) < 2:
+                    await notify_admin_once("usage_enable", "❗️Usage: /enable +998...")
+                    continue
+                phone = _normalize_phone(parts[1])
+                try:
+                    supabase.table("userbot_accounts").update({"status": "pending"}).eq("phone_number", phone).execute()
+                    await notify_admin_once(f"en_{phone}", f"✅ Enabled (pending): {phone}")
+                except Exception as e:
+                    await notify_admin_once(f"en_err_{phone}", f"❌ Enable xato: {phone}\n{e}")
+                continue
+
+            if text.startswith("/del"):
+                parts = text.split()
+                if len(parts) < 2:
+                    await notify_admin_once("usage_del", "❗️Usage: /del +998...")
+                    continue
+
+                phone = _normalize_phone(parts[1])
+                # DB delete
+                try:
+                    supabase.table("userbot_accounts").delete().eq("phone_number", phone).execute()
+                except Exception:
+                    pass
+
+                # Session delete
+                sess_base = session_base_for_phone(phone)
+                deleted = await safe_delete_session_files(sess_base, tries=10)
+
+                await notify_admin_once(
+                    f"del_{phone}",
+                    f"🧹 O'chirildi: {phone}\n"
+                    f"📄 DB: ✅ (yoki yo'q)\n"
+                    f"💾 Session: {'✅' if deleted else '❌ (file lock bo‘lishi mumkin)'}\n"
+                    f"📁 {sess_base}.session"
+                )
+                continue
+
+            if text.startswith("/list"):
+                try:
+                    res = supabase.table("userbot_accounts").select("phone_number,status").execute()
+                    rows = res.data or []
+                    lines = [f"{r.get('phone_number')} — {r.get('status')}" for r in rows][:80]
+                    await notify_admin_once("list", "📋 Accounts:\n" + ("\n".join(lines) if lines else "Bo'sh"))
+                except Exception as e:
+                    await notify_admin_once("list_err", f"❌ /list xato: {e}")
+                continue
 
 
 # ===================== HANDLER =====================
@@ -544,23 +722,19 @@ def create_message_handler(phone: str):
         chat_id = message.chat.id
         group_name = getattr(message.chat, "title", None) or f"Chat {chat_id}"
 
-        # loop oldini olish: faqat DRIVERS guruhdan qaytmasin
         if normalize_chat_id(chat_id) == normalize_chat_id(DRIVERS_GROUP_ID):
             return
 
-        # keywords refresh
         now = time.time()
         if now - last_cache_update > CACHE_TTL:
             await refresh_keywords()
 
-        # text + urls
         cleaned_text, urls = extract_text_and_urls(message)
         if not cleaned_text:
             return
 
         lower_text = cleaned_text.lower()
 
-        # keyword
         matched_keyword = None
         for kw in keywords_cache:
             if kw and kw in lower_text:
@@ -571,16 +745,12 @@ def create_message_handler(phone: str):
 
         cache_key = (normalize_chat_id(chat_id), int(message.id))
 
-        # agar allaqachon queued/sent bo'lsa skip
         async with forward_lock:
             st = forwarded_cache.get(cache_key)
             if st and st.get("status") in ("queued", "sent"):
                 return
 
-        # sender (bosiladigan link)
-        client_html = build_sender_anchor(message)
-
-        # source link
+        sender_html = build_sender_anchor(message)
         message_link = get_message_link(message)
         group_link = get_chat_link(message)
 
@@ -589,45 +759,33 @@ def create_message_handler(phone: str):
         forward_text = (
             f"🔔 <b>Yangi buyurtma</b>\n"
             f"📍 Guruh: <b>{html.escape(group_name)}</b>\n"
-            f"👤 Kimdan: {client_html}\n\n"
+            f"👤 Kimdan: {sender_html}\n\n"
             f"{safe_text}\n\n"
             f"🔗 {message_link}"
         )
 
-        # hit log (bloklamasin)
         asyncio.create_task(save_keyword_hit(matched_keyword, chat_id, group_name, phone, cleaned_text))
 
-        # queue ga tashlaymiz
         try:
             send_queue.put_nowait((cache_key, forward_text, group_link, message_link, urls))
         except asyncio.QueueFull:
             await send_queue.put((cache_key, forward_text, group_link, message_link, urls))
 
-        # ENDI status "queued" qo'yamiz (xabar aniq queuega tushdi)
         async with forward_lock:
             forwarded_cache[cache_key] = {"ts": time.time(), "status": "queued"}
-
-        print(f"📨 [{phone}] Topildi: '{matched_keyword}' - {group_name}")
 
     return handle_message
 
 
 # ===================== RUN CLIENT =====================
-async def run_client(phone: str, retry_count: int = 0):
-    MAX_RETRIES = 2
-
-    print(
-        f"\n📱 [{phone}] Ishga tushmoqda..."
-        + (f" (qayta urinish {retry_count})" if retry_count > 0 else "")
-    )
-
+async def run_client(phone: str):
+    print(f"\n📱 [{phone}] Ishga tushmoqda...")
     update_account_status(phone, "connecting")
 
-    session_name = f"userbot_session_{phone.replace('+', '').replace(' ', '')}"
+    session_base = session_base_for_phone(phone)
 
-    # Katta guruhlar uchun workers ko'paytirdik
     client = Client(
-        session_name,
+        session_base,  # <-- MUHIM: full path
         api_id=API_ID,
         api_hash=API_HASH,
         phone_number=phone,
@@ -652,8 +810,8 @@ async def run_client(phone: str, retry_count: int = 0):
                     if client and client.is_connected:
                         await sync_all_groups(client, phone)
                         print_statistics()
-                except Exception as e:
-                    print(f"⚠️ [{phone}] periodic_sync xato: {e}")
+                except Exception:
+                    pass
 
         asyncio.create_task(periodic_sync())
         await asyncio.Event().wait()
@@ -662,22 +820,39 @@ async def run_client(phone: str, retry_count: int = 0):
         msg = str(e)
         print(f"❌ [{phone}] Xato: {msg}")
 
-        if "AUTH_KEY_UNREGISTERED" in msg:
-            try:
-                for suffix in [".session", ".session-journal"]:
-                    path = f"{session_name}{suffix}"
-                    if os.path.exists(path):
-                        os.remove(path)
-                        print(f"🧹 [{phone}] Session o'chirildi: {path}")
-            except Exception as cleanup_err:
-                print(f"⚠️ [{phone}] Session tozalashda xato: {cleanup_err}")
+        # Avval clientni to'xtatib file lock bo'shashsin
+        try:
+            await client.stop()
+        except Exception:
+            pass
 
-            if retry_count < MAX_RETRIES:
-                print(f"🔄 [{phone}] Qayta login qilish...")
-                await asyncio.sleep(2)
-                return await run_client(phone, retry_count + 1)
+        if "AUTH_KEY_DUPLICATED" in msg:
+            deleted = await safe_delete_session_files(session_base, tries=12)
+            update_account_status(phone, "relogin_required")
+
+            await notify_admin_once(
+                f"dup_{phone}",
+                "⚠️ AUTH_KEY_DUPLICATED\n"
+                f"📱 Raqam: {phone}\n"
+                f"🧹 Session delete: {'✅' if deleted else '❌ (Win lock, task managerda python yopib qayta)'}\n"
+                "🔁 Qayta login kerak (bitta joyda ishlating)."
+            )
+            return
+
+        if "AUTH_KEY_UNREGISTERED" in msg:
+            deleted = await safe_delete_session_files(session_base, tries=12)
+            update_account_status(phone, "relogin_required")
+            await notify_admin_once(
+                f"unreg_{phone}",
+                "⚠️ AUTH_KEY_UNREGISTERED\n"
+                f"📱 Raqam: {phone}\n"
+                f"🧹 Session delete: {'✅' if deleted else '❌'}\n"
+                "🔁 Qayta login kerak."
+            )
+            return
 
         update_account_status(phone, "error")
+        await notify_admin_once(f"err_{phone}", f"❌ Userbot error\n📱 {phone}\n🧾 {msg}")
         return
 
 
@@ -686,19 +861,24 @@ async def main():
     global ALL_PHONES, aiohttp_session
 
     print("🚀 UserBot Multi-Account ishga tushmoqda...")
+    print(f"📁 BASE_DIR: {BASE_DIR}")
+    print(f"📁 SESS_DIR: {SESS_DIR}")
+    print(f"📁 CWD: {os.getcwd()}")
 
     if not init_supabase():
         print("❌ Supabase'ga ulanib bo'lmadi. Chiqish...")
         sys.exit(1)
 
-    # AIOHTTP session + workerlar (BIR MARTA)
     aiohttp_session = aiohttp.ClientSession()
+
     for i in range(max(1, SEND_WORKERS)):
         asyncio.create_task(send_worker(i + 1))
     print(f"📤 Yuborish workerlari: {max(1, SEND_WORKERS)} ta")
 
     await load_groups_cache()
     await ensure_accounts_seeded_from_env()
+
+    asyncio.create_task(admin_command_poller())
 
     phones = fetch_phone_numbers_from_db() or PHONE_NUMBERS_ENV_FALLBACK
     phones = uniq_keep_order(phones)
@@ -733,9 +913,12 @@ async def main():
                 await start_phone(p)
 
     asyncio.create_task(watch_new_accounts())
+
+    await notify_admin_once("started", "✅ Userbot ishga tushdi.")
     await asyncio.Event().wait()
 
 
+# ===================== ENTRY =====================
 if __name__ == "__main__":
     try:
         asyncio.run(main())
@@ -743,7 +926,7 @@ if __name__ == "__main__":
         print("\n👋 UserBot to'xtatildi")
         for phone in list(running_clients.keys()) or PHONE_NUMBERS_ENV_FALLBACK:
             update_account_status(phone, "stopped")
-        # Session yopish (best effort)
+
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -752,11 +935,12 @@ if __name__ == "__main__":
             loop.close()
         except Exception:
             pass
+
     except Exception as e:
         print(f"❌ Kritik xato: {e}")
         for phone in list(running_clients.keys()):
             update_account_status(phone, "error")
-        # Session yopish (best effort)
+
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
