@@ -51,14 +51,9 @@ account_stats = {}          # phone -> {"groups_count": N, "active_count": N}
 running_clients = {}        # phone -> asyncio.Task
 ALL_PHONES = []             # full phones list for statistics
 
-# ===== DEDUPE (MUHIM!) =====
-forwarded_cache: Dict[Tuple[int, int], Dict[str, float]] = {}
-FORWARD_TTL = 300
-forward_lock = asyncio.Lock()
-
-# ===== OUTBOUND QUEUE =====
-send_queue: asyncio.Queue = asyncio.Queue(maxsize=5000)
-SEND_WORKERS = int(os.getenv("SEND_WORKERS", "6") or "6")
+# ===== OUTBOUND QUEUE (KATTA QILINDI) =====
+send_queue: asyncio.Queue = asyncio.Queue(maxsize=50000)
+SEND_WORKERS = int(os.getenv("SEND_WORKERS", "20") or "20")
 aiohttp_session: aiohttp.ClientSession = None
 
 # ===== ADMIN NOTIFY DEDUPE =====
@@ -296,14 +291,15 @@ async def send_to_drivers_group(
             await session.close()
 
 
+# ===== DEDUPE O'CHIRILDI: endi keyword bo'lsa, doim yuboradi =====
 async def send_worker(worker_id: int):
-    global aiohttp_session, forwarded_cache
+    global aiohttp_session
     while True:
         item = await send_queue.get()
         try:
-            cache_key, forward_text, group_link, message_link, urls = item
+            _, forward_text, group_link, message_link, urls = item
 
-            ok = await send_to_drivers_group(
+            await send_to_drivers_group(
                 forward_text,
                 group_link=group_link,
                 message_link=message_link,
@@ -311,24 +307,7 @@ async def send_worker(worker_id: int):
                 session=aiohttp_session
             )
 
-            async with forward_lock:
-                if ok:
-                    forwarded_cache[cache_key] = {"ts": time.time(), "status": "sent"}
-                else:
-                    forwarded_cache.pop(cache_key, None)
-
-                now_ts = time.time()
-                for k, st in list(forwarded_cache.items()):
-                    if now_ts - float(st.get("ts", 0)) > FORWARD_TTL:
-                        forwarded_cache.pop(k, None)
-
         except Exception as e:
-            try:
-                cache_key = item[0]
-                async with forward_lock:
-                    forwarded_cache.pop(cache_key, None)
-            except Exception:
-                pass
             print(f"⚠️ send_worker[{worker_id}] xato: {e}")
         finally:
             send_queue.task_done()
@@ -716,11 +695,12 @@ async def admin_command_poller():
 # ===================== HANDLER =====================
 def create_message_handler(phone: str):
     async def handle_message(client: Client, message: Message):
-        global last_cache_update, forwarded_cache
+        global last_cache_update
 
         chat_id = message.chat.id
         group_name = getattr(message.chat, "title", None) or f"Chat {chat_id}"
 
+        # Shafiyorlar gruxidan o'zini o'zi forward qilmasin
         if normalize_chat_id(chat_id) == normalize_chat_id(DRIVERS_GROUP_ID):
             return
 
@@ -742,13 +722,6 @@ def create_message_handler(phone: str):
         if not matched_keyword:
             return
 
-        cache_key = (normalize_chat_id(chat_id), int(message.id))
-
-        async with forward_lock:
-            st = forwarded_cache.get(cache_key)
-            if st and st.get("status") in ("queued", "sent"):
-                return
-
         sender_html = build_sender_anchor(message)
         message_link = get_message_link(message)
         group_link = get_chat_link(message)
@@ -765,13 +738,20 @@ def create_message_handler(phone: str):
 
         asyncio.create_task(save_keyword_hit(matched_keyword, chat_id, group_name, phone, cleaned_text))
 
-        try:
-            send_queue.put_nowait((cache_key, forward_text, group_link, message_link, urls))
-        except asyncio.QueueFull:
-            await send_queue.put((cache_key, forward_text, group_link, message_link, urls))
+        # ===== MUHIM: Handler queue sababli blok bo'lmasin =====
+        cache_key = (normalize_chat_id(chat_id), int(message.id))
 
-        async with forward_lock:
-            forwarded_cache[cache_key] = {"ts": time.time(), "status": "queued"}
+        async def _enqueue():
+            try:
+                send_queue.put_nowait((cache_key, forward_text, group_link, message_link, urls))
+            except asyncio.QueueFull:
+                await asyncio.sleep(0.2)
+                try:
+                    send_queue.put_nowait((cache_key, forward_text, group_link, message_link, urls))
+                except asyncio.QueueFull:
+                    await send_queue.put((cache_key, forward_text, group_link, message_link, urls))
+
+        asyncio.create_task(_enqueue())
 
     return handle_message
 
@@ -872,7 +852,7 @@ async def main():
 
     for i in range(max(1, SEND_WORKERS)):
         asyncio.create_task(send_worker(i + 1))
-    print(f"📤 Yuborish workerlari: {max(1, SEND_WORKERS)} ta")
+    print(f"📤 Yuborish workerlari: {max(1, SEND_WORKERS)} ta | queue={send_queue.maxsize}")
 
     await load_groups_cache()
     await ensure_accounts_seeded_from_env()
